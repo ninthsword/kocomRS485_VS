@@ -294,7 +294,11 @@ class Kocom(rs485):
         self.wp_elevator = self.client._wp_elevator
         self.wp_thermostat = self.client._wp_thermostat
         for d_name in KOCOM_DEVICE.values():
-            if d_name == DEVICE_ELEVATOR or d_name == DEVICE_GAS:
+            if d_name == DEVICE_ELEVATOR: #or d_name == DEVICE_GAS:
+                self.wp_list[d_name] = {}
+                self.wp_list[d_name][DEVICE_WALLPAD] = {'scan': {'tick': 0, 'count': 0, 'last': 0}}
+                self.wp_list[d_name][DEVICE_WALLPAD][d_name] = {'state': 'off', 'set': 'off', 'last': 'state', 'count': 0}
+            elif d_name == DEVICE_GAS:
                 self.wp_list[d_name] = {}
                 self.wp_list[d_name][DEVICE_WALLPAD] = {'scan': {'tick': 0, 'count': 0, 'last': 0}}
                 self.wp_list[d_name][DEVICE_WALLPAD][d_name] = {'state': 'off', 'set': 'off', 'last': 'state', 'count': 0}
@@ -409,7 +413,9 @@ class Kocom(rs485):
                 return
             elif _topic[3] == 'scan':
                 for d_name in KOCOM_DEVICE.values():
-                    if d_name == DEVICE_ELEVATOR or d_name == DEVICE_GAS:
+                    if d_name == DEVICE_ELEVATOR: # or d_name == DEVICE_GAS:
+                        self.wp_list[d_name][DEVICE_WALLPAD] = {'scan': {'tick': 0, 'count': 0, 'last': 0}}
+                    elif d_name == DEVICE_GAS:
                         self.wp_list[d_name][DEVICE_WALLPAD] = {'scan': {'tick': 0, 'count': 0, 'last': 0}}
                     elif d_name == DEVICE_FAN:
                         self.wp_list[d_name][DEVICE_WALLPAD] = {'scan': {'tick': 0, 'count': 0, 'last': 0}}
@@ -451,12 +457,14 @@ class Kocom(rs485):
                 device = DEVICE_GAS
             try:
                 if device == DEVICE_GAS:
-                    if payload == 'on':
-                        payload = 'off'
-                        logger.info('[From HA]Error GAS Cannot Set to ON')
-                    else:
-                        self.wp_list[device][room][sub_device][command] = payload
-                        self.wp_list[device][room][sub_device]['last'] = command
+                    # ① 내부 state 에 반영
+                    self.wp_list[device][room][sub_device][command] = payload
+                    self.wp_list[device][room][sub_device]['last'] = 'set'
+                    # 실제 “state” 필드도 바꿔 주고
+                    self.set_list(device, room, payload)
+                    # ② HA 에 바로 퍼블리시
+                    self.send_to_homeassistant(device, room, payload)
+                    return
                 elif device == DEVICE_ELEVATOR:
                     if payload == 'off':
                         self.wp_list[device][room][sub_device][command] = payload
@@ -570,6 +578,7 @@ class Kocom(rs485):
                 publish_list.append({ha_topic : ''})
             else:
                 publish_list.append({ha_topic : json.dumps(ha_payload)})
+        
         if self.wp_gas:
             ha_topic = '{}/{}/{}_{}/config'.format(HA_PREFIX, HA_SWITCH, 'wallpad', DEVICE_GAS)
             ha_payload = {
@@ -743,9 +752,17 @@ class Kocom(rs485):
 
         if initial:
             self.d_mqtt.subscribe(subscribe_list)
+            if self.wp_gas:
+                last_state = self.wp_list[DEVICE_GAS][DEVICE_WALLPAD][DEVICE_GAS]['state']
+                self.send_to_homeassistant(DEVICE_GAS, DEVICE_WALLPAD, last_state)
+        
         for ha in publish_list:
             for topic, payload in ha.items():
-                self.d_mqtt.publish(topic, payload)
+                if self.wp_gas:
+                    self.d_mqtt.publish(topic, payload, retain=True)
+                else:
+                    self.d_mqtt.publish(topic, payload)
+        
         self.ha_registry = ha_topic
 
     def send_to_homeassistant(self, device, room, value):
@@ -765,10 +782,10 @@ class Kocom(rs485):
             logger.info("[To HA]{}/{}/{}/state = {}".format(HA_PREFIX, HA_SWITCH, room, v_value))
         elif device == DEVICE_GAS:
             v_value = json.dumps({device: value})
-            self.d_mqtt.publish("{}/{}/{}_{}/state".format(HA_PREFIX, HA_SENSOR, room, DEVICE_GAS), v_value)
-            logger.info("[To HA]{}/{}/{}_{}/state = {}".format(HA_PREFIX, HA_SENSOR, room, DEVICE_GAS, v_value))
-            self.d_mqtt.publish("{}/{}/{}_{}/state".format(HA_PREFIX, HA_SWITCH, room, DEVICE_GAS), v_value)
-            logger.info("[To HA]{}/{}/{}_{}/state = {}".format(HA_PREFIX, HA_SWITCH, room, DEVICE_GAS, v_value))
+            self.d_mqtt.publish("{}/{}/{}_{}/state".format(HA_PREFIX, HA_SENSOR, room, DEVICE_GAS), v_value, retain=True)
+            #logger.info("[To HA]{}/{}/{}_{}/state = {}".format(HA_PREFIX, HA_SENSOR, room, DEVICE_GAS, v_value))
+            self.d_mqtt.publish("{}/{}/{}_{}/state".format(HA_PREFIX, HA_SWITCH, room, DEVICE_GAS), v_value, retain=True)
+            #logger.info("[To HA]{}/{}/{}_{}/state = {}".format(HA_PREFIX, HA_SWITCH, room, DEVICE_GAS, v_value))
         elif device == DEVICE_FAN:
             self.d_mqtt.publish("{}/{}/{}/state".format(HA_PREFIX, HA_FAN, room), v_value)
             logger.info("[To HA]{}/{}/{}/state = {}".format(HA_PREFIX, HA_FAN, room, v_value))
@@ -781,8 +798,6 @@ class Kocom(rs485):
             hex_d = row_data.hex()
             start_hex = ''
             if packet_name == 'kocom':  start_hex = 'aa'
-            elif packet_name == 'grex_ventilator':  start_hex = 'd1'
-            elif packet_name == 'grex_controller':  start_hex = 'd0'
             if hex_d == start_hex:
                 start_flag = True
             if start_flag:
@@ -851,21 +866,36 @@ class Kocom(rs485):
                 v['value'] = self.parse_thermostat(p['value'], self.wp_list[v['src_device']][v['src_room']]['target_temp']['state'])
             elif v['src_device'] == DEVICE_WALLPAD and v['dst_device'] == DEVICE_ELEVATOR:
                 v['value'] = 'off'
-            elif v['src_device'] == DEVICE_GAS:
-                v['value'] = v['command']
             return v
         except:
             return False
 
+    def _fake_gas_response(self):
+        # 마지막에 알고 있는 상태를 꺼내서 RS‑485와 MQTT에 모두 보내줍니다.
+        last = self.wp_list[DEVICE_GAS][DEVICE_WALLPAD][DEVICE_GAS]['state']
+        pkt  = self.make_packet(DEVICE_GAS, DEVICE_WALLPAD, '상태', DEVICE_GAS, last)
+        logger.debug(f"[To kocom] 가스 가짜 응답: {pkt}")
+        self.write(pkt)
+        self.set_list(DEVICE_GAS, DEVICE_WALLPAD, last)
+        # HA 센서/스위치 토픽에도 올바른 상태를 퍼블리시
+        self.send_to_homeassistant(DEVICE_GAS, DEVICE_WALLPAD, last)
+        
     def packet_parsing(self, packet, name='kocom', from_to='From'):
         p = self.parse_packet(packet)
         v = self.value_packet(p)
 
         try:
             if v['command'] == "조회" and v['src_device'] == DEVICE_WALLPAD:
+                # 가스 차단기(DEVICE_GAS) 조회에 대한 가짜 응답 처리
+                try:
+                    if v['dst_device'] == DEVICE_GAS:
+                        self._fake_gas_response()
+                except Exception:
+                    logger.exception(f"[{from_to} {name}] 가스 fake 응답 중 예외")
+                
                 if name == 'HA':
                     self.write(self.make_packet(v['dst_device'], v['dst_room'], '조회', '', ''))
-                logger.debug('[{} {}]{}({}) {}({}) -> {}({})'.format(from_to, name, v['type'], v['command'], v['src_device'], v['src_room'], v['dst_device'], v['dst_room']))
+                logger.debug('[{} {}]{}({}) {}({}) -> {}({})'.format(from_to, name, v['type'], v['command'], v['src_device'], v['src_room'], v['dst_device'], v['dst_room']))             
             else:
                 logger.debug('[{} {}]{}({}) {}({}) -> {}({}) = {}'.format(from_to, name, v['type'], v['command'], v['src_device'], v['src_room'], v['dst_device'], v['dst_room'], v['value']))
 
@@ -939,10 +969,15 @@ class Kocom(rs485):
                 if now - self.tick > KOCOM_INTERVAL / 1000:
                     try:
                         for device, d_list in self.wp_list.items():
-                            if type(d_list) == dict and ((device == DEVICE_ELEVATOR and self.wp_elevator) or (device == DEVICE_FAN and self.wp_fan) or (device == DEVICE_GAS and self.wp_gas) or (device == DEVICE_LIGHT and self.wp_light) or (device == DEVICE_PLUG and self.wp_plug) or (device == DEVICE_THERMOSTAT and self.wp_thermostat)):
+                            if device == DEVICE_GAS and self.wp_gas:
+                                # RS‑485에 쓰지는 않고, HA로만 state publish
+                                st = self.wp_list[DEVICE_GAS][DEVICE_WALLPAD][DEVICE_GAS]['state']
+                                self.send_to_homeassistant(DEVICE_GAS, DEVICE_WALLPAD, st)
+                                continue
+                            if type(d_list) == dict and ((device == DEVICE_ELEVATOR and self.wp_elevator) or (device == DEVICE_FAN and self.wp_fan) or (device == DEVICE_LIGHT and self.wp_light) or (device == DEVICE_PLUG and self.wp_plug) or (device == DEVICE_THERMOSTAT and self.wp_thermostat)):
                                 for room, r_list in d_list.items():
                                     if type(r_list) == dict:
-                                        if 'scan' in r_list and type(r_list['scan']) == dict and now - r_list['scan']['tick'] > SCAN_INTERVAL and ((device == DEVICE_FAN and self.wp_fan) or (device == DEVICE_GAS and self.wp_gas) or (device == DEVICE_LIGHT and self.wp_light) or (device == DEVICE_PLUG and self.wp_plug) or (device == DEVICE_THERMOSTAT and self.wp_thermostat)):
+                                        if 'scan' in r_list and type(r_list['scan']) == dict and now - r_list['scan']['tick'] > SCAN_INTERVAL and ((device == DEVICE_FAN and self.wp_fan) or (device == DEVICE_LIGHT and self.wp_light) or (device == DEVICE_PLUG and self.wp_plug) or (device == DEVICE_THERMOSTAT and self.wp_thermostat)):
                                             if now - r_list['scan']['last'] > 2:
                                                 r_list['scan']['count'] += 1
                                                 r_list['scan']['last'] = now
@@ -976,6 +1011,15 @@ class Kocom(rs485):
             time.sleep(0.2)
 
     def set_serial(self, device, room, target, value, cmd='상태'):
+        try:
+            # ① 가스 차단기는 HA 상태만 반영 → time guard·기존 로직 스킵
+            if device == DEVICE_GAS:
+                # fake response + MQTT 퍼블리시 모두 _fake_gas_response에서 처리
+                self._fake_gas_response()
+                return
+        except Exception:
+            logger.exception("[set_serial] 가스 fake 응답 중 예외")
+        
         if (time.time() - self.tick) < KOCOM_INTERVAL / 1000:
             return
         if cmd == '상태':
@@ -992,6 +1036,7 @@ class Kocom(rs485):
             logger.debug('[To {}]{}({}) {}({}) -> {}({}) = {}'.format(self._name, v['type'], v['command'], v['src_device'], v['src_room'], v['dst_device'], v['dst_room'], v['value']))
         if device == DEVICE_ELEVATOR:
             self.send_to_homeassistant(DEVICE_ELEVATOR, DEVICE_WALLPAD, 'on')
+
         self.write(packet)
 
     def make_packet(self, device, room, cmd, target, value):
@@ -1011,7 +1056,7 @@ class Kocom(rs485):
                 p_cmd = KOCOM_COMMAND_REV.get('on')
                 p_value = '0000000000000000'
             elif device == DEVICE_GAS:
-                p_cmd = KOCOM_COMMAND_REV.get('off')
+                p_cmd = KOCOM_COMMAND_REV.get(value)
                 p_value = '0000000000000000'
             elif device == DEVICE_LIGHT or device == DEVICE_PLUG:
                 try:
